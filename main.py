@@ -1,401 +1,375 @@
-from kivy.app import App
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.label import Label
-from kivy.uix.button import Button
-from kivy.core.window import Window
-from kivy.clock import Clock
-from kivy.utils import platform
-
-from kivymd.app import MDApp
-from kivymd.uix.screen import MDScreen
-from kivymd.uix.button import MDFlatButton
-from kivymd.uix.dialog import MDDialog
-from kivymd.uix.boxlayout import MDBoxLayout
-
-import threading
-import time
 import os
+import sys
+import json
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog
+import pyaudio
+import numpy as np
+import wave
+import tempfile
+from vosk import Model, KaldiRecognizer
 
-# Import platform-specific modules conditionally
-if platform == 'android':
-    from jnius import autoclass
-    from android.permissions import request_permissions, check_permission, Permission
-    from android import mActivity
-    
-    # Android classes needed for media projection
-    Intent = autoclass('android.content.Intent')
-    MediaProjectionManager = autoclass('android.media.projection.MediaProjectionManager')
-    Context = autoclass('android.content.Context')
-    
-    # For speech recognition using Vosk
-    try:
-        from vosk import Model, KaldiRecognizer
-        import json
-    except ImportError:
-        pass
-    
-    # Import our service implementation
-    from service import start_service, stop_service
-
-
-class PatternLock(MDBoxLayout):
-    """Pattern Lock screen for authentication"""
-    def __init__(self, unlock_callback, **kwargs):
-        super().__init__(**kwargs)
-        self.orientation = 'vertical'
-        self.unlock_callback = unlock_callback
-        self.pattern = []
-        self.correct_pattern = [1, 5, 9, 6, 3]  # Example pattern: diagonal + L shape
+class FloatingTranscriptionWindow:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("System Audio Transcriber")
+        self.root.attributes('-topmost', True)  # Always on top
+        self.root.overrideredirect(True)  # Remove window decorations
         
-        # Title
-        self.add_widget(Label(
-            text='Draw Pattern to Unlock',
-            size_hint=(1, 0.2)
-        ))
+        self.width = 400
+        self.height = 300
+        self.x = 100
+        self.y = 100
         
-        # Pattern grid
-        self.grid_layout = BoxLayout(
-            orientation='vertical',
-            size_hint=(1, 0.6)
-        )
+        # Set initial window position and size
+        self.root.geometry(f"{self.width}x{self.height}+{self.x}+{self.y}")
         
-        # Create 3x3 grid of buttons
-        for i in range(3):
-            row = BoxLayout()
-            for j in range(3):
-                btn_id = i * 3 + j + 1  # Button IDs: 1-9
-                btn = Button(
-                    text=str(btn_id),
-                    on_press=lambda x, id=btn_id: self.add_to_pattern(id)
-                )
-                row.add_widget(btn)
-            self.grid_layout.add_widget(row)
-            
-        self.add_widget(self.grid_layout)
+        # Create a frame with a border
+        self.frame = ttk.Frame(self.root, relief="raised", borderwidth=2)
+        self.frame.pack(fill=tk.BOTH, expand=True)
         
-        # Status label
-        self.status_label = Label(
-            text='Draw your pattern',
-            size_hint=(1, 0.1)
-        )
-        self.add_widget(self.status_label)
+        # Create a title bar
+        self.title_bar = ttk.Frame(self.frame)
+        self.title_bar.pack(fill=tk.X, side=tk.TOP)
+        
+        # Title label
+        self.title_label = ttk.Label(self.title_bar, text="System Audio Transcription")
+        self.title_label.pack(side=tk.LEFT, padx=5)
         
         # Control buttons
-        controls = BoxLayout(size_hint=(1, 0.1))
+        self.min_button = ttk.Button(self.title_bar, text="—", width=2, 
+                                    command=self.minimize)
+        self.min_button.pack(side=tk.RIGHT)
         
-        clear_btn = Button(
-            text='Clear',
-            on_press=self.clear_pattern
-        )
-        controls.add_widget(clear_btn)
+        self.close_button = ttk.Button(self.title_bar, text="✕", width=2, 
+                                      command=self.close_window)
+        self.close_button.pack(side=tk.RIGHT)
         
-        submit_btn = Button(
-            text='Submit',
-            on_press=self.check_pattern
-        )
-        controls.add_widget(submit_btn)
+        # Transcript text area
+        self.text_frame = ttk.Frame(self.frame)
+        self.text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        self.add_widget(controls)
-    
-    def add_to_pattern(self, btn_id):
-        """Add button to current pattern sequence"""
-        self.pattern.append(btn_id)
-        # Update status to show progress
-        self.status_label.text = f'Pattern: {"* " * len(self.pattern)}'
-    
-    def clear_pattern(self, instance):
-        """Clear the current pattern"""
-        self.pattern = []
-        self.status_label.text = 'Pattern cleared'
-    
-    def check_pattern(self, instance):
-        """Verify if pattern matches the correct one"""
-        if self.pattern == self.correct_pattern:
-            self.status_label.text = 'Pattern correct!'
-            # Call the unlock callback after successful authentication
-            self.unlock_callback()
-        else:
-            self.status_label.text = 'Incorrect pattern. Try again.'
-            self.pattern = []
-
-
-class TranscriptionPopup(FloatLayout):
-    """Floating popup that displays transcription text"""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        self.text_area = tk.Text(self.text_frame, wrap=tk.WORD, state=tk.NORMAL)
+        self.text_area.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         
-        # Background with some transparency
-        self.size_hint = (0.8, 0.3)
-        self.pos_hint = {'center_x': 0.5, 'top': 0.9}
+        self.scrollbar = ttk.Scrollbar(self.text_frame, command=self.text_area.yview)
+        self.scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
         
-        # Main layout
-        self.layout = BoxLayout(orientation='vertical')
+        self.text_area.config(yscrollcommand=self.scrollbar.set)
         
-        # Transcription text area
-        self.transcription_label = Label(
-            text='Waiting for audio...',
-            halign='left',
-            valign='top',
-            size_hint=(1, 0.8),
-            text_size=(Window.width * 0.75, None)
-        )
-        self.layout.add_widget(self.transcription_label)
+        # Write initialization message to text area
+        self.text_area.insert(tk.END, "System Audio Transcriber initialized.\n")
+        self.text_area.insert(tk.END, "1. Select a Vosk model directory using the 'Select Model' button.\n")
+        self.text_area.insert(tk.END, "2. Click 'Start' to begin transcription.\n\n")
+        self.text_area.see(tk.END)
+        
+        # Status bar
+        self.status_bar = ttk.Frame(self.frame)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        self.status_label = ttk.Label(self.status_bar, text="Ready")
+        self.status_label.pack(side=tk.LEFT, padx=5)
         
         # Control panel
-        controls = BoxLayout(
-            size_hint=(1, 0.2),
-            spacing=10
-        )
+        self.control_panel = ttk.Frame(self.frame)
+        self.control_panel.pack(fill=tk.X, side=tk.BOTTOM, before=self.status_bar, pady=5)
         
-        # Resize handles
-        self.minimize_btn = Button(
-            text='-',
-            size_hint=(0.15, 1)
-        )
-        self.minimize_btn.bind(on_press=self.minimize)
+        self.start_button = ttk.Button(self.control_panel, text="Start", command=self.start_transcription)
+        self.start_button.pack(side=tk.LEFT, padx=5)
         
-        self.maximize_btn = Button(
-            text='+',
-            size_hint=(0.15, 1)
-        )
-        self.maximize_btn.bind(on_press=self.maximize)
+        self.stop_button = ttk.Button(self.control_panel, text="Stop", command=self.stop_transcription, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
         
-        # Close button
-        self.close_btn = Button(
-            text='×',
-            size_hint=(0.15, 1)
-        )
-        self.close_btn.bind(on_press=self.close)
+        self.clear_button = ttk.Button(self.control_panel, text="Clear", command=self.clear_text)
+        self.clear_button.pack(side=tk.LEFT, padx=5)
         
-        controls.add_widget(self.minimize_btn)
-        controls.add_widget(self.maximize_btn)
-        controls.add_widget(self.close_btn)
+        self.model_button = ttk.Button(self.control_panel, text="Select Model", command=self.select_model)
+        self.model_button.pack(side=tk.LEFT, padx=5)
         
-        self.layout.add_widget(controls)
-        self.add_widget(self.layout)
+        # Debug button to list audio devices
+        self.debug_button = ttk.Button(self.control_panel, text="List Devices", command=self.list_audio_devices)
+        self.debug_button.pack(side=tk.LEFT, padx=5)
         
-        # For dragging the popup
-        self.touch_start = None
+        # Bind event handlers for dragging
+        self.title_bar.bind("<ButtonPress-1>", self.start_drag)
+        self.title_bar.bind("<ButtonRelease-1>", self.stop_drag)
+        self.title_bar.bind("<B1-Motion>", self.do_drag)
+        
+        # Bind event handlers for resizing
+        self.root.bind("<ButtonPress-3>", self.start_resize)
+        self.root.bind("<ButtonRelease-3>", self.stop_resize)
+        self.root.bind("<B3-Motion>", self.do_resize)
+        
+        # Transcription variables
+        self.is_transcribing = False
+        self.transcription_thread = None
+        self.audio_stream = None
+        self.audio = None
+        self.model = None
+        self.recognizer = None
+        self.model_path = None
+        self.loopback_device_index = None
+        
+        # Initialize Audio
+        self.initialize_audio()
+        
+    def start_drag(self, event):
+        self.x_offset = event.x
+        self.y_offset = event.y
     
-    def on_touch_down(self, touch):
-        """Handle touch events for dragging the popup"""
-        if self.collide_point(*touch.pos):
-            # Store touch position for dragging
-            self.touch_start = touch.pos
-            return True
-        return super().on_touch_down(touch)
+    def stop_drag(self, event):
+        self.x_offset = None
+        self.y_offset = None
     
-    def on_touch_move(self, touch):
-        """Move popup when dragged"""
-        if self.touch_start:
-            # Calculate how much to move
-            dx = touch.x - self.touch_start[0]
-            dy = touch.y - self.touch_start[1]
+    def do_drag(self, event):
+        if self.x_offset is not None and self.y_offset is not None:
+            x = self.root.winfo_pointerx() - self.x_offset
+            y = self.root.winfo_pointery() - self.y_offset
+            self.root.geometry(f"+{x}+{y}")
+    
+    def start_resize(self, event):
+        self.x_resize = event.x
+        self.y_resize = event.y
+    
+    def stop_resize(self, event):
+        self.x_resize = None
+        self.y_resize = None
+    
+    def do_resize(self, event):
+        if self.x_resize is not None and self.y_resize is not None:
+            width = max(200, self.root.winfo_width() + (event.x - self.x_resize))
+            height = max(150, self.root.winfo_height() + (event.y - self.y_resize))
+            self.root.geometry(f"{width}x{height}")
+            self.x_resize = event.x
+            self.y_resize = event.y
+    
+    def minimize(self):
+        self.root.withdraw()
+        
+        # Create a small icon in the system tray
+        icon = tk.Toplevel(self.root)
+        icon.overrideredirect(True)
+        icon.attributes('-topmost', True)
+        icon.geometry("30x30+0+0")
+        
+        icon_button = ttk.Button(icon, text="📝", command=lambda: self.restore(icon))
+        icon_button.pack(fill=tk.BOTH, expand=True)
+    
+    def restore(self, icon):
+        self.root.deiconify()
+        icon.destroy()
+    
+    def close_window(self):
+        self.stop_transcription()
+        self.root.destroy()
+        sys.exit()
+    
+    def clear_text(self):
+        self.text_area.delete(1.0, tk.END)
+        self.text_area.insert(tk.END, "Transcription cleared.\n")
+    
+    def initialize_audio(self):
+        try:
+            self.audio = pyaudio.PyAudio()
+            self.update_text("Audio system initialized.")
+            self.find_loopback_device()
+        except Exception as e:
+            self.update_text(f"Error initializing audio: {str(e)}")
+    
+    def find_loopback_device(self):
+        """Find and store the loopback device index"""
+        found_devices = []
+        for i in range(self.audio.get_device_count()):
+            device_info = self.audio.get_device_info_by_index(i)
+            device_name = device_info.get('name', '')
+            if device_info.get('maxInputChannels', 0) > 0:
+                found_devices.append(f"Device {i}: {device_name} (in: {device_info.get('maxInputChannels')}, out: {device_info.get('maxOutputChannels')})")
+                
+                # Look for common loopback device names
+                if any(keyword in device_name.lower() for keyword in ["stereo mix", "what u hear", "loopback", "wave out", "monitor"]):
+                    self.loopback_device_index = i
+                    self.update_text(f"Found loopback device: {device_name} (Device {i})")
+                    return
+        
+        # Log all found devices
+        self.update_text("All input devices:")
+        for device in found_devices:
+            self.update_text(device)
             
-            # Update position
-            self.pos_hint = {
-                'center_x': self.pos_hint['center_x'] + dx / Window.width,
-                'top': self.pos_hint['top'] + dy / Window.height
-            }
-            
-            # Update touch start position
-            self.touch_start = touch.pos
-            return True
-        return super().on_touch_move(touch)
+        # Default to default input if no loopback device found
+        default_input = self.audio.get_default_input_device_info()
+        self.loopback_device_index = default_input['index']
+        self.update_text(f"No loopback device found. Using default input: {default_input['name']} (Device {self.loopback_device_index})")
+        self.update_text("NOTE: Default device will likely capture microphone, not system audio.")
+        self.update_text("Enable 'Stereo Mix' in Windows Sound settings or use a virtual audio cable.")
     
-    def on_touch_up(self, touch):
-        """Reset touch start position"""
-        self.touch_start = None
-        return super().on_touch_up(touch)
+    def list_audio_devices(self):
+        """Debug function to list all audio devices"""
+        self.text_area.delete(1.0, tk.END)
+        self.update_text("Available Audio Devices:")
+        
+        for i in range(self.audio.get_device_count()):
+            device_info = self.audio.get_device_info_by_index(i)
+            device_name = device_info.get('name', '')
+            inputs = device_info.get('maxInputChannels', 0)
+            outputs = device_info.get('maxOutputChannels', 0)
+            self.update_text(f"Device {i}: {device_name}")
+            self.update_text(f"  Input channels: {inputs}, Output channels: {outputs}")
+            self.update_text(f"  Default sample rate: {device_info.get('defaultSampleRate')}")
+            
+            if i == self.loopback_device_index:
+                self.update_text(f"  ** SELECTED FOR CAPTURE **")
+            
+            self.update_text("")
+        
+        default_input = self.audio.get_default_input_device_info()
+        default_output = self.audio.get_default_output_device_info()
+        self.update_text(f"Default input: Device {default_input['index']} - {default_input['name']}")
+        self.update_text(f"Default output: Device {default_output['index']} - {default_output['name']}")
+        
+        self.update_text("\nTo capture system audio, enable 'Stereo Mix' in Windows Sound settings")
+        self.update_text("or use a virtual audio cable solution like VB-Cable.")
+    
+    def select_model(self):
+        model_dir = filedialog.askdirectory(title="Select Vosk Model Directory")
+        if model_dir:
+            self.model_path = model_dir
+            self.status_label.config(text=f"Model: {os.path.basename(model_dir)}")
+            self.update_text(f"Selected model: {os.path.basename(model_dir)}")
     
     def update_text(self, text):
-        """Update the transcription text"""
-        self.transcription_label.text = text
+        """Add text to the transcription window and scroll to show it"""
+        self.text_area.insert(tk.END, text + "\n")
+        self.text_area.see(tk.END)
     
-    def minimize(self, instance):
-        """Reduce the size of the popup"""
-        self.size_hint = (0.5, 0.2)
-    
-    def maximize(self, instance):
-        """Increase the size of the popup"""
-        self.size_hint = (0.8, 0.4)
-    
-    def close(self, instance):
-        """Hide the popup"""
-        self.parent.remove_widget(self)
-
-
-class MainScreen(MDScreen):
-    """Main application screen with pattern lock"""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.popup = None
-        self.service = None
-        self.projection_manager = None
+    def start_transcription(self):
+        if self.is_transcribing:
+            return
         
-        # Media Projection request code
-        self.MEDIA_PROJECTION_REQUEST = 1000
+        if not self.model_path:
+            self.update_text("Please select a Vosk model directory first.")
+            return
         
-        # Start with pattern lock
-        self.pattern_lock = PatternLock(
-            unlock_callback=self.show_popup
-        )
-        self.add_widget(self.pattern_lock)
+        try:
+            # Load the model
+            self.update_text("Loading speech recognition model...")
+            self.model = Model(self.model_path)
+            self.recognizer = KaldiRecognizer(self.model, 16000)
+            
+            # Update UI
+            self.start_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+            self.status_label.config(text="Transcribing...")
+            
+            # Start transcription in a separate thread
+            self.is_transcribing = True
+            self.transcription_thread = threading.Thread(target=self.transcribe)
+            self.transcription_thread.daemon = True
+            self.transcription_thread.start()
+            
+            self.update_text("Started transcription. Speaking will appear here...")
+            
+        except Exception as e:
+            self.update_text(f"Error starting transcription: {str(e)}")
+            self.status_label.config(text="Error")
     
-    def show_popup(self):
-        """Show the transcription popup after successful authentication"""
-        # Remove pattern lock
-        self.remove_widget(self.pattern_lock)
+    def stop_transcription(self):
+        if not self.is_transcribing:
+            return
         
-        # Add a message about starting the service
-        self.starting_label = Label(
-            text="Starting transcription service...\nRequesting necessary permissions.",
-            halign='center'
-        )
-        self.add_widget(self.starting_label)
+        self.is_transcribing = False
         
-        # Request necessary permissions
-        if platform == 'android':
-            # Request permissions
-            permissions = [
-                Permission.RECORD_AUDIO,
-                Permission.SYSTEM_ALERT_WINDOW,
-                'android.permission.FOREGROUND_SERVICE',
-                'android.permission.CAPTURE_AUDIO_OUTPUT'
-            ]
-            request_permissions(permissions, self._on_permissions)
-        else:
-            # Skip permission check on non-Android platforms
-            self._create_popup()
+        if self.audio_stream:
+            self.audio_stream.stop_stream()
+            self.audio_stream.close()
+            self.audio_stream = None
+        
+        # Update UI
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Stopped")
+        self.update_text("Transcription stopped.")
     
-    def _on_permissions(self, permissions, grants):
-        """Callback for permission requests"""
-        # Check if all permissions were granted
-        if all(grants):
-            # Request media projection permission
-            self._request_media_projection()
-        else:
-            # Show error if permissions were denied
-            self.clear_widgets()
-            error_label = Label(
-                text="Cannot start transcription without required permissions.",
-                halign='center'
+    def transcribe(self):
+        try:
+            # Setup audio capture parameters
+            FORMAT = pyaudio.paInt16
+            CHANNELS = 1
+            RATE = 16000
+            CHUNK = 4000
+            
+            self.update_text(f"Opening audio stream from device {self.loopback_device_index}")
+            
+            # Open stream for capturing
+            self.audio_stream = self.audio.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+                input_device_index=self.loopback_device_index
             )
-            retry_button = Button(
-                text="Try Again",
-                size_hint=(0.5, 0.1),
-                pos_hint={'center_x': 0.5, 'center_y': 0.4}
-            )
-            retry_button.bind(on_press=lambda x: self.__init__())
             
-            self.add_widget(error_label)
-            self.add_widget(retry_button)
-    
-    def _request_media_projection(self):
-        """Request MediaProjection permission from the user"""
-        if platform == 'android':
-            # Get the MediaProjectionManager
-            context = mActivity.getApplicationContext()
-            self.projection_manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+            self.update_text("Audio stream opened successfully")
+            silent_chunks = 0
             
-            # Create media projection intent
-            intent = self.projection_manager.createScreenCaptureIntent()
-            
-            # Set up activity result handling
-            def on_activity_result(request_code, result_code, data):
-                if request_code == self.MEDIA_PROJECTION_REQUEST:
-                    if result_code == -1:  # RESULT_OK
-                        # Media projection permission granted
-                        self._create_popup_with_service(result_code, data)
+            while self.is_transcribing:
+                # Read audio data
+                try:
+                    data = self.audio_stream.read(CHUNK, exception_on_overflow=False)
+                    
+                    # Simple check if audio data is not silent
+                    audio_data = np.frombuffer(data, dtype=np.int16)
+                    if np.abs(audio_data).mean() < 100:
+                        silent_chunks += 1
+                        if silent_chunks >= 10:  # About 2.5 seconds of silence
+                            silent_chunks = 0
+                            self.root.after(0, lambda: self.status_label.config(text="Listening (silent)"))
+                        continue
                     else:
-                        # Permission denied
-                        self.clear_widgets()
-                        error_label = Label(
-                            text="Media projection permission denied. Cannot transcribe system audio.",
-                            halign='center'
-                        )
-                        retry_button = Button(
-                            text="Try Again",
-                            size_hint=(0.5, 0.1),
-                            pos_hint={'center_x': 0.5, 'center_y': 0.4}
-                        )
-                        retry_button.bind(on_press=lambda x: self._request_media_projection())
-                        
-                        self.add_widget(error_label)
-                        self.add_widget(retry_button)
+                        silent_chunks = 0
+                        self.root.after(0, lambda: self.status_label.config(text="Transcribing..."))
+                    
+                    # Process audio for transcription
+                    if self.recognizer.AcceptWaveform(data):
+                        result = self.recognizer.Result()
+                        result_dict = json.loads(result)
+                        if 'text' in result_dict and result_dict['text'].strip():
+                            transcript_text = result_dict['text']
+                            # Update UI from the main thread
+                            self.root.after(0, lambda t=transcript_text: self.update_text(t))
+                    else:
+                        # Get partial results
+                        partial = json.loads(self.recognizer.PartialResult())
+                        if 'partial' in partial and partial['partial'].strip():
+                            partial_text = partial['partial']
+                            # Update status with partial text
+                            self.root.after(0, lambda t=partial_text: self.status_label.config(text=f"Partial: {t[:20]}{'...' if len(t) > 20 else ''}"))
+                            
+                except IOError as e:
+                    # Handle buffer overflow gracefully
+                    if "Input overflowed" in str(e):
+                        continue
+                    else:
+                        self.root.after(0, lambda e=e: self.update_text(f"Audio error: {str(e)}"))
+                except Exception as e:
+                    self.root.after(0, lambda e=e: self.update_text(f"Error processing audio: {str(e)}"))
+                
+        except Exception as e:
+            self.root.after(0, lambda e=e: self.update_text(f"Transcription error: {str(e)}"))
+            self.root.after(0, lambda: self.status_label.config(text="Error"))
             
-            # Register activity result callback
-            from android import activity
-            activity.bind(on_activity_result=on_activity_result)
-            
-            # Start activity for result
-            mActivity.startActivityForResult(intent, self.MEDIA_PROJECTION_REQUEST)
-        else:
-            # Create popup directly on non-Android platforms
-            self._create_popup()
-    
-    def _create_popup_with_service(self, projection_code, projection_data):
-        """Create and show the transcription popup with service started"""
-        # Clear the main screen
-        self.clear_widgets()
-        
-        # Create floating popup
-        self.popup = TranscriptionPopup()
-        self.add_widget(self.popup)
-        
-        # Start the transcription service with media projection data
-        if platform == 'android':
-            self.service = start_service(
-                projection_code,
-                projection_data,
-                callback=self.update_transcription
-            )
-        else:
-            self.popup.update_text("System audio transcription only works on Android")
-    
-    def _create_popup(self):
-        """Create popup for non-Android platforms (for development)"""
-        # Clear the main screen
-        self.clear_widgets()
-        
-        # Create floating popup
-        self.popup = TranscriptionPopup()
-        self.add_widget(self.popup)
-        
-        # Set demo text
-        self.popup.update_text("System audio transcription only works on Android")
-    
-    def update_transcription(self, text):
-        """Update transcription text in the popup"""
-        if self.popup:
-            def update_ui(*args):
-                self.popup.update_text(text)
-            
-            # Update UI on the main thread
-            Clock.schedule_once(update_ui)
-    
-    def on_pause(self):
-        """Allow the app to pause without stopping"""
-        return True
-    
-    def on_resume(self):
-        """Handle app resumption"""
-        pass
-    
-    def on_stop(self):
-        """Stop transcription when app is closed"""
-        if platform == 'android' and self.service:
-            stop_service()
+        finally:
+            # Clean up
+            self.is_transcribing = False
+            self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
 
+def main():
+    root = tk.Tk()
+    app = FloatingTranscriptionWindow(root)
+    root.mainloop()
 
-class SystemAudioTranscriberApp(MDApp):
-    """Main application class"""
-    def build(self):
-        self.theme_cls.primary_palette = "Blue"
-        self.theme_cls.theme_style = "Dark"
-        return MainScreen()
-
-
-if __name__ == '__main__':
-    SystemAudioTranscriberApp().run()
+if __name__ == "__main__":
+    main()
