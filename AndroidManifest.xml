@@ -1,3 +1,66 @@
-<uses-permission android:name="android.permission.RECORD_AUDIO"/>
-<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.systemaudiotranscriber"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- Permission to record audio -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    
+    <!-- Permission to draw over other apps -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    
+    <!-- Permission to run as a foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    
+    <!-- Permission to capture audio output - requires Android 10 (API level 29) or higher -->
+    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" />
+    
+    <!-- Permission to write to external storage for cached audio files and models -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    
+    <!-- Permission for Internet access to download Vosk model if needed -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    
+    <application
+        android:label="System Audio Transcriber"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="true">
+        
+        <activity
+            android:name="org.kivy.android.PythonActivity"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:launchMode="singleTask"
+            android:exported="true">
+            
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            
+            <!-- Support Android 10+ media projection for system audio capture -->
+            <intent-filter>
+                <action android:name="android.media.projection.service.ProjectionService" />
+            </intent-filter>
+            
+            <!-- Define that this app can capture audio output -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="systemaudiotranscriber" />
+                
+            <!-- Media projection settings -->
+            <meta-data
+                android:name="android.media.AUDIO_CAPTURE"
+                android:value="true" />
+        </activity>
+        
+        <!-- Define a service for background transcription -->
+        <service
+            android:name=".TranscriptionService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection">
+        </service>
+    </application>
+</manifest>
